@@ -48,7 +48,6 @@ static const char rcsid[] =
 
 #include <sys/ucred.h>
 #include <sys/user.h>
-#include <sys/sysctl.h>
 #include <sys/cdefs.h>
 
 #ifdef __APPLE__
@@ -70,6 +69,8 @@ static const char rcsid[] =
 #include <string.h>
 #include <vis.h>
 #include <pwd.h>
+
+#include <libgetargv.h>
 
 #include "ps.h"
 
@@ -115,9 +116,6 @@ static void
 getproclline(KINFO *k, char **command_name, int *argvlen, int *argv0len,
   int show_args)
 {
-	int		mib[3], argmax, nargs, c = 0;
-	size_t		size;
-	char		*procargs, *sp, *np, *cp;
 	extern int	eflg;
 
 	/*
@@ -129,126 +127,16 @@ getproclline(KINFO *k, char **command_name, int *argvlen, int *argv0len,
 		return;
 	}
 
-	/* Get the maximum process arguments size. */
-	mib[0] = CTL_KERN;
-	mib[1] = KERN_ARGMAX;
-
-	size = sizeof(argmax);
-	if (sysctl(mib, 2, &argmax, &size, NULL, 0) == -1) {
+	struct ArgvEnvpResult result;
+	if (!get_argv_and_envp_of_pid(KI_PROC(k)->p_pid, &result)) {
 		goto ERROR_A;
 	}
 
-	/* Allocate space for the arguments. */
-	procargs = (char *)malloc(argmax);
-	if (procargs == NULL) {
-		goto ERROR_A;
-	}
-
-	/*
-	 * Make a sysctl() call to get the raw argument space of the process.
-	 * The layout is documented in start.s, which is part of the Csu
-	 * project.  In summary, it looks like:
-	 *
-	 * /---------------\ 0x00000000
-	 * :               :
-	 * :               :
-	 * |---------------|
-	 * | argc          |
-	 * |---------------|
-	 * | arg[0]        |
-	 * |---------------|
-	 * :               :
-	 * :               :
-	 * |---------------|
-	 * | arg[argc - 1] |
-	 * |---------------|
-	 * | 0             |
-	 * |---------------|
-	 * | env[0]        |
-	 * |---------------|
-	 * :               :
-	 * :               :
-	 * |---------------|
-	 * | env[n]        |
-	 * |---------------|
-	 * | 0             |
-	 * |---------------| <-- Beginning of data returned by sysctl() is here.
-	 * | argc          |
-	 * |---------------|
-	 * | exec_path     |
-	 * |:::::::::::::::|
-	 * |               |
-	 * | String area.  |
-	 * |               |
-	 * |---------------| <-- Top of stack.
-	 * :               :
-	 * :               :
-	 * \---------------/ 0xffffffff
-	 */
-	mib[0] = CTL_KERN;
-	mib[1] = KERN_PROCARGS2;
-	mib[2] = KI_PROC(k)->p_pid;
-
-	size = (size_t)argmax;
-	if (sysctl(mib, 3, procargs, &size, NULL, 0) == -1) {
-		goto ERROR_B;
-	}
-
-	memcpy(&nargs, procargs, sizeof(nargs));
-	cp = procargs + sizeof(nargs);
-
-	/* Skip the saved exec_path. */
-	for (; cp < &procargs[size]; cp++) {
-		if (*cp == '\0') {
-			/* End of exec_path reached. */
-			break;
-		}
-	}
-	if (cp == &procargs[size]) {
-		goto ERROR_B;
-	}
-
-	/* Skip trailing '\0' characters. */
-	for (; cp < &procargs[size]; cp++) {
-		if (*cp != '\0') {
-			/* Beginning of first argument reached. */
-			break;
-		}
-	}
-	if (cp == &procargs[size]) {
-		goto ERROR_B;
-	}
-	/* Save where the argv[0] string starts. */
-	sp = cp;
-
-	/*
-	 * Iterate through the '\0'-terminated strings and convert '\0' to ' '
-	 * until a string is found that has a '=' character in it (or there are
-	 * no more strings in procargs).  There is no way to deterministically
-	 * know where the command arguments end and the environment strings
-	 * start, which is why the '=' character is searched for as a heuristic.
-	 */
-	for (np = NULL; c < nargs && cp < &procargs[size]; cp++) {
-		if (*cp == '\0') {
-			c++;
-			if (np != NULL) {
-			    /* Convert previous '\0'. */
-			    *np = ' ';
-			} else {
-			    *argv0len = cp - sp;
-			}
-			/* Note location of current '\0'. */
-			np = cp;
-
-			if (!show_args) {
-			    /*
-			     * Don't convert '\0' characters to ' '.
-			     * However, we needed to know that the
-			     * command name was terminated, which we
-			     * now know.
-			     */
-			    break;
-			}
+	*argv0len = (result.argv[1] - result.argv[0]) - 1;
+	if (show_args) {
+		//for every arg except the last one, convert the terminating NUL into a space
+		for (int c = 0; c < result.argc - 1; c++) {
+			*(result.argv[c+1] - 1) = ' ';
 		}
 	}
 
@@ -258,46 +146,18 @@ getproclline(KINFO *k, char **command_name, int *argvlen, int *argv0len,
 	 * follow.
 	 */
 	if ( show_args && (eflg != 0) && ( (getuid() == 0) || (KI_EPROC(k)->e_pcred.p_ruid == getuid()) ) ) {
-		for (; cp < &procargs[size]; cp++) {
-			if (*cp == '\0') {
-				if (np != NULL) {
-					if (&np[1] == cp) {
-						/*
-						 * Two '\0' characters in a row.
-						 * This should normally only
-						 * happen after all the strings
-						 * have been seen, but in any
-						 * case, stop parsing.
-						 */
-						break;
-					}
-					/* Convert previous '\0'. */
-					*np = ' ';
-				}
-				/* Note location of current '\0'. */
-				np = cp;
-			}
+		for (int c = 0; c < result.envc - 1; c++) {
+			*(result.envp[c+1] - 1) = ' ';
 		}
 	}
 
-	/*
-	 * sp points to the beginning of the arguments/environment string, and
-	 * np should point to the '\0' terminator for the string.
-	 */
-	if (np == NULL || np == sp) {
-		/* Empty or unterminated string. */
-		goto ERROR_B;
-	}
-
 	/* Make a copy of the string. */
-	*argvlen = asprintf(command_name, "%s", sp);
+	*argvlen = asprintf(command_name, "%s", result.argv[0]);
 
 	/* Clean up. */
-	free(procargs);
+	free_ArgvEnvpResult(&result);
 	return;
 
-	ERROR_B:
-	free(procargs);
 	ERROR_A:
 	*argv0len = *argvlen 
 	  = asprintf(command_name, "(%s)", KI_PROC(k)->p_comm);
