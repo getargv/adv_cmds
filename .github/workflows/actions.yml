@@ -1,0 +1,47 @@
+name: C/xcodebuild CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ '*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-26
+          - macos-15
+          - macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        repository: getargv/getargv
+        path: getargv
+        token: ${{ secrets.GETARGV_READ }}
+    - name: Build libgetargv
+      run: make dylib
+      working-directory: getargv
+    - name: Install libgetargv
+      run: sudo make install_dylib
+      working-directory: getargv
+    - uses: actions/checkout@v6
+      with:
+        path: adv_cmds
+    - name: make
+      run: |
+        sudo mkdir -p /usr/local/include/System/sys/
+        sudo curl -o "/usr/local/include/System/sys/persona.h" https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/sys/persona.h
+        sudo curl -o "/usr/local/include/System/sys/proc.h" https://raw.githubusercontent.com/apple-oss-distributions/xnu/main/bsd/sys/proc.h
+        xcodebuild "SDKROOT=macosx" "VALID_ARCHS=$(uname -m)" "CURRENT_ARCH=$(uname -m)" "ONLY_ACTIVE_ARCH=YES" 'LIBRARY_SEARCH_PATHS=$(LIBRARY_SEARCH_PATHS) /usr/local/lib' 'OTHER_LDFLAGS=$(OTHER_LDFLAGS) -lgetargv' 'OTHER_CFLAGS=$(OTHER_CFLAGS) -DPRIVATE' 'HEADER_SEARCH_PATHS=$(HEADER_SEARCH_PATHS) /usr/local/include' -scheme ps
+      working-directory: adv_cmds
+    - uses: actions/upload-artifact@v5
+      with:
+        name: ${{ matrix.os }}
+        path: ~/Library/Developer/Xcode/DerivedData/adv_cmds-*/Build/Products/Release/ps*
